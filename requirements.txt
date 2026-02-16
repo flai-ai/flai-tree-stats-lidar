@@ -1,0 +1,8 @@
+numpy
+laspy[lazrs]
+rasterio
+scipy
+pandas
+fiona
+geopandas
+shapely
