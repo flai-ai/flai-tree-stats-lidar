@@ -6,3 +6,5 @@ pandas
 fiona
 geopandas
 shapely
+tqdm
+threadpoolctl

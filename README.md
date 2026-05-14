@@ -179,6 +179,125 @@ flai_forest plots extract-params `
    -f "csv"
  ```
 
+---
+## **Per-tile raster mode (`rasters extract-params`)**
+
+For wall-to-wall raster outputs computed directly from LAZ tiles with an
+already-computed DEM, use the `rasters` group. Each output raster pixel is
+treated as a square plot (default 10 m). One GeoTIFF is written per LAZ tile
+per parameter, organized in subfolders by parameter name.
+
+### Inputs
+- A folder of LAZ/LAS tiles (e.g. 1 km × 1 km each, classified with ground
+  and vegetation classes).
+- *(Optional)* A folder of DEM GeoTIFFs whose filenames match the LAZ
+  filenames (only the extension differs, e.g. `tile_001.laz` ↔
+  `tile_001.tif`). When omitted, a DEM is built **on the fly** from each
+  tile's ground-class returns at `--dem-pixel-size` (default 0.5 m) using
+  multi-threaded k-NN inverse-distance weighting.
+
+### Outputs
+- `<save>/<param>/<laz_basename>.tif` — one float32 GeoTIFF per parameter
+  per tile, snapped to a `pixel_size`-aligned grid, NaN where insufficient
+  points were available.
+
+### Quick start
+```bash
+# with a pre-built DEM folder
+flai_forest rasters extract-params \
+    -l ./laz \
+    -d ./dem \
+    -s ./out \
+    -e "dem,height,canopy" \
+    --pixel-size 10 \
+    --workers 4 \
+    --cell-workers 4
+
+# without a DEM folder -- DEM is interpolated from ground returns at 0.5 m
+flai_forest rasters extract-params \
+    -l ./laz \
+    -s ./out \
+    -e "dem,height,canopy" \
+    --pixel-size 10 \
+    --dem-pixel-size 0.5
+```
+
+### Options
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-l, --lidar` | required | Folder of LAZ/LAS tiles. |
+| `-d, --dem` | *(none)* | Folder of DEM TIFs (matching basenames). If omitted, a DEM is built on the fly per tile. |
+| `-s, --save` | required | Output folder; gets one subfolder per parameter. |
+| `-e, --extract` | `dem,height,canopy,kde,voxel` | Metric groups to compute. |
+| `--pixel-size` | `10.0` | Output raster pixel size (in CRS units). Each pixel is treated as a square plot of this size. |
+| `--dem-pixel-size` | `0.5` | DEM pixel size used when `--dem` is not provided. Also the scale at which slope/aspect are derived. |
+| `--idw-power` | `2.0` | IDW power exponent for the on-the-fly DEM. |
+| `--idw-k` | `12` | Number of nearest neighbours used per cell in the IDW DEM. |
+| `-w, --workers` | `4` | Number of LAZ tiles processed in parallel (process pool). Keep low if storage I/O is the bottleneck. |
+| `-t, --cell-workers` | `4` | Threads used for per-cell metric computation inside one tile and for the IDW kNN query. |
+| `--blas-threads` | `1` | Cap BLAS / OpenMP / MKL thread pools per worker process. Default 1 gives predictable total core usage of `workers x cell_workers`. |
+| `--ground-class` | `2` | LAS classification value for ground. |
+| `--vegetation-classes` | `3,4,5` | Comma-separated LAS classification values for vegetation. |
+| `--min-points` | `4` | Minimum vegetation point count per cell to compute metrics; cells below this are written as NaN. |
+| `--skip-existing / --overwrite` | `skip-existing` | Skip a tile when every parameter TIF already exists. |
+| `--progress / --no-progress` | `progress` | Show a tqdm progress bar with ETA. |
+| `--crs` | *(none)* | Override the CRS for outputs when the LAZ has no SRS VLR. Accepts anything `rasterio.crs.CRS.from_user_input()` handles (e.g. `EPSG:3794`). |
+
+### Parallelism layers
+
+There are five layers of concurrency in play at runtime. Only the first two
+are direct CLI knobs; the others are internal but worth knowing about so you
+don't oversubscribe a machine.
+
+| Layer | Controlled by | Notes |
+|---|---|---|
+| **Tile-level (process pool)** | `--workers N` | One whole LAZ tile per Python process. True CPU parallelism, separate memory per process. Main I/O contention point — keep low on spinning disks, bump up on NVMe. |
+| **Cell-level (thread pool)** | `--cell-workers M` | Inside a tile, non-empty cells are split into chunks processed by M threads. NumPy-heavy metrics (`height`, `canopy`, `kde`) release the GIL and scale well; the `voxel` gap-analysis loop is GIL-bound and benefits less. |
+| **IDW kNN query** | `--cell-workers M` (reused) | `scipy.cKDTree.query` uses M threads when building an on-the-fly DEM. |
+| **NumPy / SciPy BLAS** | `--blas-threads N` (uses `threadpoolctl` + env vars in the worker) | Used by `scipy.stats.gaussian_kde`, `cKDTree`, and similar matrix operations. **Capped to 1 by default** so total core usage stays at `workers × cell_workers`. Raise it if BLAS-heavy metrics benefit from intra-tile multi-core matmul. |
+
+DEM aggregation no longer goes through `rasterio.warp.reproject` (it now uses
+a pure-numpy block average); supplied DEMs must be aligned with the output
+grid (same upper-left origin, integer pixel-size ratio) or a clear
+`ValueError` is raised.
+
+Effective worst-case concurrency is roughly **`workers × cell_workers × BLAS_threads`**. With the defaults (4 × 4) plus uncapped BLAS that can saturate a 16-core machine. Recommended starting points:
+
+- **NVMe / fast local storage, 16+ cores**: `-w 8 -t 2`, set `OPENBLAS_NUM_THREADS=1` to prevent BLAS oversubscription.
+- **HDD or networked storage**: `-w 2 -t 4` — keep concurrent tile reads low.
+- **Voxel-heavy runs** (GIL-bound metric): `-w 8 -t 1` — more processes, no inner threading needed.
+
+### Resuming after failures
+Each run writes two files at the top of `--save` if any tile fails:
+- `failed_tiles.txt` — one LAZ path per line; feed it back into a re-run with
+  `xargs` or by pointing `--lidar` at a directory of symlinks.
+- `failed_tiles.csv` — `tile,laz_path,error` for diagnostics.
+
+These files are cleared at the start of a clean run. A live `tqdm` progress
+bar shows ok/skip/fail counts and ETA; use `--no-progress` to disable.
+
+### Notes
+- The **voxel** metric uses a vectorised implementation in
+  `rasters/voxel_fast.py` that produces bit-identical results to
+  `metrices/voxel.py` but is ~20× faster per cell. The plot-based workflow
+  still uses the original.
+- Tiles are processed **self-contained** (no neighbour reads). Expect minor
+  edge effects on the outermost row/column of each tile for slope/aspect.
+- Vegetation Z is normalised by subtracting the DEM at native resolution at
+  every point's `(x, y)`.
+- Slope / aspect / eastness / northness are derived **at the DEM's native
+  resolution** (e.g. 50 cm) and then averaged onto the 10 m output grid
+  (aspect is recovered via `atan2(mean(eastness), mean(northness))` so the
+  circular average is correct). On rough terrain this is order-of-magnitude
+  closer to the true cell-mean slope than the alternative of averaging the
+  DEM first and deriving on the coarse grid.
+- When the DEM is computed on the fly, slope/aspect carry the noise of the
+  IDW reconstruction (≈ `point_noise / dem_pixel_size` per cell). Use a
+  cleaner supplied DEM if precise topography is needed.
+- `voxel` and to a lesser extent `kde` are much slower than `dem/height/canopy`.
+  Start with `-e dem,height,canopy` for a fast first pass and add the heavy
+  groups only when needed.
+
 
 ## **Notes**
 
